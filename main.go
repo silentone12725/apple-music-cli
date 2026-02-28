@@ -44,6 +44,7 @@ var (
 	dl_song        bool
 	artist_select  bool
 	debug_mode     bool
+	play_stream    bool
 	alac_max       *int
 	atmos_max      *int
 	mv_max         *int
@@ -436,6 +437,7 @@ type SearchResultItem struct {
 	Detail string
 	URL    string
 	ID     string
+	Traits []string // AudioTraits from the Search API (e.g. "dolby-atmos", "hi-res-lossless")
 }
 
 // QualityOption holds information about a downloadable quality.
@@ -471,11 +473,23 @@ func promptForQuality(item SearchResultItem, token string) (string, error) {
 
 	fmt.Printf("\nFetching available qualities for: %s\n", item.Name)
 
+	hasAtmos := false
+	for _, trait := range item.Traits {
+		if trait == "dolby-atmos" || trait == "atmos" {
+			hasAtmos = true
+			break
+		}
+	}
+
 	qualities := []QualityOption{
 		{ID: "alac", Description: "Lossless (ALAC)"},
 		{ID: "aac", Description: "High-Quality (AAC)"},
-		{ID: "atmos", Description: "Dolby Atmos"},
 	}
+	// Conditionally append Atmos only if the Search API confirms it's available
+	if hasAtmos {
+		qualities = append(qualities, QualityOption{ID: "atmos", Description: "Dolby Atmos"})
+	}
+
 	qualityOptions := []string{}
 	for _, q := range qualities {
 		qualityOptions = append(qualityOptions, q.Description)
@@ -495,6 +509,23 @@ func promptForQuality(item SearchResultItem, token string) (string, error) {
 	}
 
 	return qualities[selectedIndex].ID, nil
+}
+
+// promptForAction asks the user whether they want to download or stream
+func promptForAction() error {
+	prompt := &survey.Select{
+		Message: "Choose an action:",
+		Options: []string{"Download", "Stream"},
+	}
+	var choice string
+	err := survey.AskOne(prompt, &choice)
+	if err != nil {
+		return err
+	}
+	if choice == "Stream" {
+		play_stream = true
+	}
+	return nil
 }
 
 // handleSearch manages the entire interactive search process.
@@ -542,7 +573,7 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 					trackInfo := fmt.Sprintf("%d tracks", item.Attributes.TrackCount)
 					detail := fmt.Sprintf("%s (%s, %s)", item.Attributes.ArtistName, year, trackInfo)
 					displayOptions = append(displayOptions, fmt.Sprintf("%s - %s", item.Attributes.Name, detail))
-					items = append(items, SearchResultItem{Type: "Album", URL: item.Attributes.URL, ID: item.ID})
+					items = append(items, SearchResultItem{Type: "Album", Name: item.Attributes.Name, URL: item.Attributes.URL, ID: item.ID, Traits: item.Attributes.AudioTraits})
 				}
 				hasNext = searchResp.Results.Albums.Next != ""
 			}
@@ -551,7 +582,7 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 				for _, item := range searchResp.Results.Songs.Data {
 					detail := fmt.Sprintf("%s (%s)", item.Attributes.ArtistName, item.Attributes.AlbumName)
 					displayOptions = append(displayOptions, fmt.Sprintf("%s - %s", item.Attributes.Name, detail))
-					items = append(items, SearchResultItem{Type: "Song", URL: item.Attributes.URL, ID: item.ID})
+					items = append(items, SearchResultItem{Type: "Song", Name: item.Attributes.Name, URL: item.Attributes.URL, ID: item.ID, Traits: item.Attributes.AudioTraits})
 				}
 				hasNext = searchResp.Results.Songs.Next != ""
 			}
@@ -563,7 +594,7 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 						detail = strings.Join(item.Attributes.GenreNames, ", ")
 					}
 					displayOptions = append(displayOptions, fmt.Sprintf("%s (%s)", item.Attributes.Name, detail))
-					items = append(items, SearchResultItem{Type: "Artist", URL: item.Attributes.URL, ID: item.ID})
+					items = append(items, SearchResultItem{Type: "Artist", Name: item.Attributes.Name, URL: item.Attributes.URL, ID: item.ID, Traits: []string{}})
 				}
 				hasNext = searchResp.Results.Artists.Next != ""
 			}
@@ -756,6 +787,22 @@ func convertIfNeeded(track *task.Track) {
 	}
 }
 
+// PlayMedia launches ffplay or mpv to play the given file path.
+func PlayMedia(filePath string) error {
+	var cmd *exec.Cmd
+	if _, err := exec.LookPath("ffplay"); err == nil {
+		cmd = exec.Command("ffplay", "-i", filePath, "-nodisp", "-autoexit")
+	} else if _, err := exec.LookPath("mpv"); err == nil {
+		cmd = exec.Command("mpv", filePath)
+	} else {
+		return errors.New("missing media player dependency (ffplay or mpv)")
+	}
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	var err error
 	counter.Total++
@@ -901,6 +948,104 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	if err != nil {
 		fmt.Println("Failed to check if track exists.")
 	}
+
+	// --- UNIFIED STREAMING LOGIC ---
+	if play_stream {
+		// Play local file immediately if it already exists on disk.
+		var playPath string
+		if existsOriginal {
+			playPath = trackPath
+		} else if considerConverted {
+			existsConverted, _ := fileExists(convertedPath)
+			if existsConverted {
+				playPath = convertedPath
+			}
+		}
+		if playPath != "" {
+			fmt.Println("\n▶️ Playing local file from disk...")
+			if err := PlayMedia(playPath); err != nil {
+				fmt.Println("Playback error:", err)
+			}
+			return
+		}
+
+		// ── AAC STREAM PIPELINE ──────────────────────────────────────────────────
+		// Real-time fragment-by-fragment streaming: decrypt each moof+mdat as it
+		// arrives and pipe immediately to the player.  Playback starts within ~200ms
+		// of the first fragment being decrypted — no full-file download required.
+		if needDlAacLc {
+			fmt.Println("\n▶️ Starting AAC stream...")
+			pr, pw := io.Pipe()
+			go func() {
+				err := runv3.RunStream(track.ID, token, mediaUserToken, pw)
+				pw.CloseWithError(err) // signals EOF (or error) to the player
+			}()
+			var aacCmd *exec.Cmd
+			if _, err := exec.LookPath("ffplay"); err == nil {
+				aacCmd = exec.Command("ffplay", "-i", "pipe:0", "-nodisp", "-autoexit")
+			} else if _, err := exec.LookPath("mpv"); err == nil {
+				aacCmd = exec.Command("mpv", "-")
+			} else {
+				fmt.Println("Missing media player (ffplay or mpv)")
+				pr.Close()
+				return
+			}
+			aacCmd.Stdin = pr
+			aacCmd.Stdout = os.Stdout
+			aacCmd.Stderr = os.Stderr
+			if err := aacCmd.Run(); err != nil {
+				fmt.Println("Playback error:", err)
+			}
+			return
+		}
+
+		// ── ALAC / ATMOS STREAM PIPELINE ─────────────────────────────────────────
+		// Decrypt to a temp file in /dev/shm (RAM-backed tmpfs) so ffplay can seek
+		// and report the correct full duration via the injected mehd box.
+		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
+		if err != nil {
+			fmt.Println("Failed to extract info from manifest:", err)
+			return
+		}
+		tmpDir := "/dev/shm"
+		if _, serr := os.Stat(tmpDir); serr != nil {
+			tmpDir = os.TempDir()
+		}
+		tempFile, err := os.CreateTemp(tmpDir, "am-stream-*.m4a")
+		if err != nil {
+			fmt.Println("Temp file error:", err)
+			return
+		}
+		tempPath := tempFile.Name()
+		tempFile.Close()
+		fmt.Print("\n⏳ Preparing stream...")
+		if err = runv2.Run(track.ID, trackM3u8Url, tempPath, track.Resp.Attributes.DurationInMillis, Config); err != nil {
+			os.Remove(tempPath)
+			fmt.Println("\n❌ Stream preparation failed:", err)
+			return
+		}
+		fmt.Println("\n▶️ Playback started! (Press 'q' to stop)")
+		var alacCmd *exec.Cmd
+		if _, err := exec.LookPath("ffplay"); err == nil {
+			alacCmd = exec.Command("ffplay", "-i", tempPath, "-nodisp", "-autoexit")
+		} else if _, err := exec.LookPath("mpv"); err == nil {
+			alacCmd = exec.Command("mpv", tempPath)
+		} else {
+			fmt.Println("Missing media player (ffplay or mpv)")
+			os.Remove(tempPath)
+			return
+		}
+		alacCmd.Stdin = os.Stdin
+		alacCmd.Stdout = os.Stdout
+		alacCmd.Stderr = os.Stderr
+		if err := alacCmd.Run(); err != nil {
+			fmt.Println("Playback error:", err)
+		}
+		os.Remove(tempPath)
+		return
+	}
+	// ────────────────────────────────────────────────────────────────────────────
+
 	if existsOriginal {
 		fmt.Println("Track already exists locally.")
 		counter.Success++
@@ -941,7 +1086,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			return
 		}
 		//边下载边解密
-		err = runv2.Run(track.ID, trackM3u8Url, trackPath, Config)
+		err = runv2.Run(track.ID, trackM3u8Url, trackPath, track.Resp.Attributes.DurationInMillis, Config)
 		if err != nil {
 			fmt.Println("Failed to run v2:", err)
 			counter.Error++
@@ -1417,11 +1562,31 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	}
 
 	if dl_song {
-		if urlArg_i == "" {
-		} else {
+		if urlArg_i != "" {
 			for i := range album.Tracks {
 				if urlArg_i == album.Tracks[i].ID {
-					ripTrack(&album.Tracks[i], token, mediaUserToken)
+					if play_stream {
+						for {
+							fmt.Printf("\n▶️ Now Playing: %s - %s\n", album.Tracks[i].Resp.Attributes.ArtistName, album.Tracks[i].Resp.Attributes.Name)
+							ripTrack(&album.Tracks[i], token, mediaUserToken)
+
+							navPrompt := &survey.Select{
+								Message: "Playback stopped. Choose next action:",
+								Options: []string{"🔁 Replay", "⏹️ Stop"},
+							}
+							var choice string
+							if err := survey.AskOne(navPrompt, &choice); err != nil {
+								return nil // Exit on Ctrl+C
+							}
+							if choice == "⏹️ Stop" {
+								return nil
+							}
+							// 🔁 Replay: loop repeats
+						}
+					} else {
+						// Original download behaviour
+						ripTrack(&album.Tracks[i], token, mediaUserToken)
+					}
 					return nil
 				}
 			}
@@ -1434,15 +1599,60 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	} else {
 		selected = album.ShowSelect()
 	}
-	for i := range album.Tracks {
-		i++
-		if isInArray(okDict[albumId], i) {
-			counter.Total++
-			counter.Success++
-			continue
+	if play_stream {
+		i := 0
+		for i < len(selected) {
+			trackIndex := selected[i] - 1
+			track := &album.Tracks[trackIndex]
+
+			fmt.Printf("\n▶️ Now Playing: %s - %s\n", track.Resp.Attributes.ArtistName, track.Resp.Attributes.Name)
+
+			// Play the track (blocks until finished or skipped via 'q' in mpv)
+			ripTrack(track, token, mediaUserToken)
+
+			if i == len(selected)-1 {
+				fmt.Println("End of queue.")
+				break
+			}
+
+			navPrompt := &survey.Select{
+				Message: "Playback stopped. Choose next action:",
+				Options: []string{"⏭️ Next Track", "⏮️ Previous Track", "🔁 Replay", "⏹️ Stop"},
+				PageSize: 4,
+			}
+
+			var choice string
+			err := survey.AskOne(navPrompt, &choice)
+			if err != nil {
+				break
+			}
+
+			switch choice {
+			case "⏭️ Next Track":
+				i++
+			case "⏮️ Previous Track":
+				if i > 0 {
+					i--
+				} else {
+					fmt.Println("Already at the first track.")
+				}
+			case "🔁 Replay": // Do nothing, index stays the same
+			case "⏹️ Stop":
+				return nil
+			}
 		}
-		if isInArray(selected, i) {
-			ripTrack(&album.Tracks[i-1], token, mediaUserToken)
+	} else {
+		// --- ORIGINAL DOWNLOAD LOOP ---
+		for i := range album.Tracks {
+			i++
+			if isInArray(okDict[albumId], i) {
+				counter.Total++
+				counter.Success++
+				continue
+			}
+			if isInArray(selected, i) {
+				ripTrack(&album.Tracks[i-1], token, mediaUserToken)
+			}
 		}
 	}
 	return nil
@@ -1675,15 +1885,60 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	} else {
 		selected = playlist.ShowSelect()
 	}
-	for i := range playlist.Tracks {
-		i++
-		if isInArray(okDict[playlistId], i) {
-			counter.Total++
-			counter.Success++
-			continue
+	if play_stream {
+		i := 0
+		for i < len(selected) {
+			trackIndex := selected[i] - 1
+			track := &playlist.Tracks[trackIndex]
+
+			fmt.Printf("\n▶️ Now Playing: %s - %s\n", track.Resp.Attributes.ArtistName, track.Resp.Attributes.Name)
+
+			// Play the track (blocks until finished or skipped via 'q' in mpv)
+			ripTrack(track, token, mediaUserToken)
+
+			if i == len(selected)-1 {
+				fmt.Println("End of queue.")
+				break
+			}
+
+			navPrompt := &survey.Select{
+				Message: "Playback stopped. Choose next action:",
+				Options: []string{"⏭️ Next Track", "⏮️ Previous Track", "🔁 Replay", "⏹️ Stop"},
+				PageSize: 4,
+			}
+
+			var choice string
+			err := survey.AskOne(navPrompt, &choice)
+			if err != nil {
+				break
+			}
+
+			switch choice {
+			case "⏭️ Next Track":
+				i++
+			case "⏮️ Previous Track":
+				if i > 0 {
+					i--
+				} else {
+					fmt.Println("Already at the first track.")
+				}
+			case "🔁 Replay": // Do nothing, index stays the same
+			case "⏹️ Stop":
+				return nil
+			}
 		}
-		if isInArray(selected, i) {
-			ripTrack(&playlist.Tracks[i-1], token, mediaUserToken)
+	} else {
+		// --- ORIGINAL DOWNLOAD LOOP ---
+		for i := range playlist.Tracks {
+			i++
+			if isInArray(okDict[playlistId], i) {
+				counter.Total++
+				counter.Success++
+				continue
+			}
+			if isInArray(selected, i) {
+				ripTrack(&playlist.Tracks[i-1], token, mediaUserToken)
+			}
 		}
 	}
 	return nil
@@ -1806,6 +2061,7 @@ func main() {
 	aac_type = pflag.String("aac-type", Config.AacType, "Select AAC type, aac aac-binaural aac-downmix")
 	mv_audio_type = pflag.String("mv-audio-type", Config.MVAudioType, "Select MV audio type, atmos ac3 aac")
 	mv_max = pflag.Int("mv-max", Config.MVMax, "Specify the max quality for download MV")
+	pflag.BoolVar(&play_stream, "stream", false, "Enable stream mode to play music directly without saving")
 
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] [url1 url2 ...]\n", "[main | main.exe | go run main.go]")
@@ -1822,6 +2078,16 @@ func main() {
 	Config.MVMax = *mv_max
 
 	args := pflag.Args()
+
+	// Allow `--stream song "query"` as shorthand for `--stream --search song "query"`.
+	// If --search wasn't given but the first positional arg is a valid search type, promote it.
+	if search_type == "" && play_stream && len(args) >= 2 {
+		implicit := args[0]
+		if implicit == "song" || implicit == "album" || implicit == "artist" {
+			search_type = implicit
+			args = args[1:]
+		}
+	}
 
 	if search_type != "" {
 		if len(args) == 0 {
@@ -1846,6 +2112,13 @@ func main() {
 			return
 		}
 		os.Args = args
+	}
+
+	if !play_stream {
+		if err := promptForAction(); err != nil {
+			fmt.Println("\nExiting.")
+			return
+		}
 	}
 
 	if strings.Contains(os.Args[0], "/artist/") {
