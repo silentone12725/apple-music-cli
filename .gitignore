@@ -7,3 +7,8 @@
 !main.go
 !README.md
 !utils/*
+!config.yaml.example
+!README-CN.md
+!SETUP_WINDOWS.md
+!quickstart.bat
+!quickstart.ps1
