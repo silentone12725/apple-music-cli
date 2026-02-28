@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -164,6 +165,155 @@ func Run(adamId string, playlistUrl string, outfile string, durationInMillis int
 	}
 	fmt.Print("Decrypted\n")
 	return nil
+}
+
+// RunStreamWriter fetches and decrypts the ALAC/Atmos track fragment-by-fragment,
+// writing each decrypted fragment to w immediately. Designed to be called with an
+// io.Pipe writer so the consumer (ffplay) starts playing within one fragment's worth
+// of data rather than waiting for the full download+decrypt cycle.
+//
+// The file download uses HTTP/1.1 (not H2) to avoid Apple CDN sending a GOAWAY
+// frame when the reader is slow due to TCP decrypt round-trips.
+func RunStreamWriter(adamId string, playlistUrl string, w io.Writer, durationInMillis int, Config structs.ConfigSet) error {
+	// Playlist fetch can use the default client.
+	req, err := http.NewRequest("GET", playlistUrl, nil)
+	if err != nil {
+		return err
+	}
+	do, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return err
+	}
+	segments, err := parseMediaPlaylist(do.Body)
+	if err != nil {
+		return err
+	}
+	segment := segments[0]
+	if segment == nil {
+		return errors.New("no segments extracted from playlist")
+	}
+	if segment.Limit <= 0 {
+		return errors.New("non-byterange playlists are currently unsupported")
+	}
+	parsedUrl, err := url.Parse(playlistUrl)
+	if err != nil {
+		return err
+	}
+	fileUrl, err := parsedUrl.Parse(segment.URI)
+	if err != nil {
+		return err
+	}
+	// Force HTTP/1.1 for the actual media download.
+	// Apple's H2 CDN sends GOAWAY under slow-reader backpressure (TCP decrypt RTT).
+	http11 := &http.Client{
+		Transport: &http.Transport{
+			ForceAttemptHTTP2: false,
+			TLSNextProto:      map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
+		},
+	}
+	do2, err := http11.Get(fileUrl.String())
+	if err != nil {
+		return err
+	}
+	defer do2.Body.Close()
+	conn, err := net.Dial("tcp", Config.DecryptM3u8Port)
+	if err != nil {
+		return err
+	}
+	defer Close(conn)
+	return decryptFragmentsTo(conn, do2.Body, w, adamId, segments, durationInMillis)
+}
+
+// decryptFragmentsTo is the shared streaming-decrypt core: reads fMP4 fragments
+// from in, decrypts via the agent TCP conn, and writes each fragment to w immediately.
+func decryptFragmentsTo(conn io.ReadWriter, in io.Reader, w io.Writer, adamId string, playlistSegments []*m3u8.MediaSegment, durationInMillis int) error {
+	inBuf := bufio.NewReader(in)
+	outBuf := bufio.NewWriterSize(w, 256*1024)
+
+	init, offset, err := ReadInitSegment(inBuf)
+	if err != nil {
+		return err
+	}
+	if init == nil {
+		return errors.New("no init segment found")
+	}
+
+	originalInitSize := offset
+	if len(init.Moov.Traks) > 0 && durationInMillis > 0 {
+		timescale := init.Moov.Traks[0].Mdia.Mdhd.Timescale
+		fragmentDuration := int64(uint64(durationInMillis) * uint64(timescale) / 1000)
+		if init.Moov.Mvex == nil {
+			init.Moov.AddChild(&mp4.MvexBox{})
+		}
+		if init.Moov.Mvex.Mehd == nil {
+			init.Moov.Mvex.AddChild(&mp4.MehdBox{Version: 1, FragmentDuration: fragmentDuration})
+		} else {
+			init.Moov.Mvex.Mehd.FragmentDuration = fragmentDuration
+		}
+	}
+	sizeDiff := int64(init.Size()) - int64(originalInitSize)
+
+	tracks, err := TransformInit(init)
+	if err != nil {
+		return err
+	}
+	_ = sanitizeInit(init)
+	if err = init.Encode(outBuf); err != nil {
+		return err
+	}
+	if err = outBuf.Flush(); err != nil {
+		return err
+	}
+
+	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+	fragN := 0
+	for {
+		frag, newOffset, ferr := ReadNextFragment(inBuf, offset)
+		rawBytes := newOffset - offset
+		offset = newOffset
+		if ferr != nil {
+			return ferr
+		}
+		if frag == nil {
+			break
+		}
+		if sizeDiff > 0 && frag.Moof != nil {
+			for _, traf := range frag.Moof.Trafs {
+				if traf.Tfhd != nil && traf.Tfhd.HasBaseDataOffset() {
+					traf.Tfhd.BaseDataOffset += uint64(sizeDiff)
+				}
+			}
+		}
+		seg := playlistSegments[fragN]
+		if seg == nil {
+			return errors.New("segment number out of sync")
+		}
+		key := seg.Key
+		if key != nil {
+			if fragN != 0 {
+				SwitchKeys(rw)
+			}
+			if key.URI == prefetchKey {
+				SendString(rw, "0")
+			} else {
+				SendString(rw, adamId)
+			}
+			SendString(rw, key.URI)
+		}
+		if err = DecryptFragment(frag, tracks, rw); err != nil {
+			return fmt.Errorf("decryptFragment: %w", err)
+		}
+		if err = frag.Encode(outBuf); err != nil {
+			return err
+		}
+		if err = outBuf.Flush(); err != nil {
+			return err
+		}
+		fragN++
+		fmt.Printf("\r⚡ ALAC fragment %d piped to player (%d B)", fragN, rawBytes)
+	}
+	fmt.Printf("\r🎵 ALAC stream complete (%d fragments)       \n", fragN)
+	return outBuf.Flush()
 }
 
 // RunStream downloads the entire encrypted fMP4 file into memory first so the
@@ -486,6 +636,9 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 	if err != nil {
 		return err
 	}
+	if err = outBuf.Flush(); err != nil {
+		return err
+	}
 
 	// 'segment' in m3u8 == 'fragment' in mp4ff
 	//fmt.Println("Starting decryption...")
@@ -567,7 +720,6 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 		return err
 	}
 	if totalLen <= MaxMemorySize {
-		// create output file
 		ofh, err := os.Create(outfile)
 		if err != nil {
 			return err
