@@ -1000,8 +1000,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		}
 
 		// ── ALAC / ATMOS STREAM PIPELINE ─────────────────────────────────────────
-		// Decrypt to a temp file in /dev/shm (RAM-backed tmpfs) so ffplay can seek
-		// and report the correct full duration via the injected mehd box.
+		// Decrypt via the proven Run() path into a /dev/shm RAM-backed temp file.
+		// RunStreamWriter produces an fMP4 that ffplay can only parse one fragment
+		// from (~15s); Run() produces the same format as a regular download, which
+		// ffplay reads correctly.  /dev/shm means no disk I/O — effectively RAM speed.
 		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
 		if err != nil {
 			fmt.Println("Failed to extract info from manifest:", err)
@@ -1011,28 +1013,42 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		if _, serr := os.Stat(tmpDir); serr != nil {
 			tmpDir = os.TempDir()
 		}
-		tempFile, err := os.CreateTemp(tmpDir, "am-stream-*.m4a")
+		// CreateTemp just to get a unique path; close immediately so Run() can create it.
+		tf, err := os.CreateTemp(tmpDir, "am-stream-*.m4a")
 		if err != nil {
 			fmt.Println("Temp file error:", err)
 			return
 		}
-		tempPath := tempFile.Name()
-		tempFile.Close()
-		fmt.Print("\n⏳ Preparing stream...")
-		if err = runv2.Run(track.ID, trackM3u8Url, tempPath, track.Resp.Attributes.DurationInMillis, Config); err != nil {
+		tempPath := tf.Name()
+		tf.Close()
+		os.Remove(tempPath) // Run() will recreate it via os.Create
+
+		if decErr := runv2.Run(track.ID, trackM3u8Url, tempPath, track.Resp.Attributes.DurationInMillis, Config); decErr != nil {
+			fmt.Println("Decrypt error:", decErr)
 			os.Remove(tempPath)
-			fmt.Println("\n❌ Stream preparation failed:", err)
 			return
 		}
-		fmt.Println("\n▶️ Playback started! (Press 'q' to stop)")
+
+		playPath = tempPath
+
+		// Convert fMP4 → flat MP4 exactly like the regular download path does.
+		// Without this, ffplay/ffprobe can only read the first fragment (~15s).
+		mp4boxCmd := exec.Command("MP4Box", "-noprog", "-itags", "tool=", tempPath)
+		mp4boxCmd.Stderr = io.Discard
+		mp4boxCmd.Stdout = io.Discard
+		if err := mp4boxCmd.Run(); err != nil {
+			fmt.Println("Warning: MP4Box conversion failed, playback may be truncated:", err)
+		}
+
+		fmt.Println("▶️  Playback started! (Press 'q' to stop)")
 		var alacCmd *exec.Cmd
 		if _, err := exec.LookPath("ffplay"); err == nil {
-			alacCmd = exec.Command("ffplay", "-i", tempPath, "-nodisp", "-autoexit")
+			alacCmd = exec.Command("ffplay", "-i", playPath, "-nodisp", "-autoexit")
 		} else if _, err := exec.LookPath("mpv"); err == nil {
-			alacCmd = exec.Command("mpv", tempPath)
+			alacCmd = exec.Command("mpv", playPath)
 		} else {
 			fmt.Println("Missing media player (ffplay or mpv)")
-			os.Remove(tempPath)
+			os.Remove(playPath)
 			return
 		}
 		alacCmd.Stdin = os.Stdin
@@ -1041,7 +1057,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		if err := alacCmd.Run(); err != nil {
 			fmt.Println("Playback error:", err)
 		}
-		os.Remove(tempPath)
+		os.Remove(playPath)
 		return
 	}
 	// ────────────────────────────────────────────────────────────────────────────
