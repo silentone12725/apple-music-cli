@@ -44,7 +44,7 @@ func (b *TimedResponseBody) Read(p []byte) (int, error) {
 }
 
 
-func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet) error {
+func Run(adamId string, playlistUrl string, outfile string, durationInMillis int, Config structs.ConfigSet) error {
 	var err error
 	var optstimeout uint
 	optstimeout = 0
@@ -158,7 +158,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	//fmt.Print("Decrypting...\n")
 	defer Close(conn)
 
-	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, Config)
+	err = downloadAndDecryptFile(conn, body, outfile, adamId, segments, totalLen, durationInMillis, Config)
 	if err != nil {
 		return err
 	}
@@ -166,8 +166,263 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	return nil
 }
 
+// RunStream downloads the entire encrypted fMP4 file into memory first so the
+// network download runs at full speed without DRM-decryption round-trips stalling it.
+// Once the file is in a buffer it decrypts every fragment one-by-one, flushing each
+// to outfile immediately so a media player reading the growing file sees audio data
+// as soon as the first fragment is ready.
+func RunStream(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet) error {
+	header := make(http.Header)
+
+	// Fetch and parse the media playlist
+	req, err := http.NewRequest("GET", playlistUrl, nil)
+	if err != nil {
+		return err
+	}
+	req.Header = header
+	do, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return err
+	}
+	segments, err := parseMediaPlaylist(do.Body)
+	if err != nil {
+		return err
+	}
+	segment := segments[0]
+	if segment == nil {
+		return errors.New("no segments extracted from playlist")
+	}
+	if segment.Limit <= 0 {
+		return errors.New("non-byterange playlists are currently unsupported")
+	}
+
+	parsedUrl, err := url.Parse(playlistUrl)
+	if err != nil {
+		return err
+	}
+	fileUrl, err := parsedUrl.Parse(segment.URI)
+	if err != nil {
+		return err
+	}
+
+	// Phase 1: download entire encrypted file at full network speed
+	req, err = http.NewRequest("GET", fileUrl.String(), nil)
+	if err != nil {
+		return err
+	}
+	req.Header = header
+	do, err = (&http.Client{}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer do.Body.Close()
+
+	var encBuf bytes.Buffer
+	bar := progressbar.NewOptions64(
+		do.ContentLength,
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionSetElapsedTime(false),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionShowElapsedTimeOnFinish(),
+		progressbar.OptionShowCount(),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetDescription("Downloading..."),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "",
+			SaucerHead:    "",
+			SaucerPadding: "",
+			BarStart:      "",
+			BarEnd:        "",
+		}),
+	)
+	if _, err = io.Copy(io.MultiWriter(&encBuf, bar), do.Body); err != nil {
+		return err
+	}
+	fmt.Print("Downloaded\n")
+
+	// Phase 2: decrypt fragment-by-fragment directly to outfile (progressive writes)
+	conn, err := net.Dial("tcp", Config.DecryptM3u8Port)
+	if err != nil {
+		return err
+	}
+	defer Close(conn)
+
+	// MaxMemoryLimit=0 forces downloadAndDecryptFile to write every fragment to disk
+	// immediately instead of buffering in RAM, so the HTTP server can serve growing bytes.
+	streamConfig := Config
+	streamConfig.MaxMemoryLimit = 0
+
+	err = downloadAndDecryptFile(conn, &encBuf, outfile, adamId, segments, int64(encBuf.Len()), 0, streamConfig)
+	if err != nil {
+		return err
+	}
+	fmt.Print("Decrypted\n")
+	return nil
+}
+
+// DecryptToBuffer downloads the encrypted fMP4 at full network speed into RAM,
+// then decrypts every fragment into a second in-memory buffer and returns it.
+// The caller can pipe the buffer directly to a media player's stdin.
+func DecryptToBuffer(adamId string, playlistUrl string, Config structs.ConfigSet) (*bytes.Buffer, error) {
+	header := make(http.Header)
+
+	req, err := http.NewRequest("GET", playlistUrl, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = header
+	do, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	segments, err := parseMediaPlaylist(do.Body)
+	if err != nil {
+		return nil, err
+	}
+	segment := segments[0]
+	if segment == nil {
+		return nil, errors.New("no segments extracted from playlist")
+	}
+
+	parsedUrl, err := url.Parse(playlistUrl)
+	if err != nil {
+		return nil, err
+	}
+	fileUrl, err := parsedUrl.Parse(segment.URI)
+	if err != nil {
+		return nil, err
+	}
+
+	// Phase 1: download encrypted file at full network speed
+	req, err = http.NewRequest("GET", fileUrl.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = header
+	do, err = (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer do.Body.Close()
+
+	var encBuf bytes.Buffer
+	bar := progressbar.NewOptions64(
+		do.ContentLength,
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionSetElapsedTime(false),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionShowElapsedTimeOnFinish(),
+		progressbar.OptionShowCount(),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetDescription("Downloading..."),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "",
+			SaucerHead:    "",
+			SaucerPadding: "",
+			BarStart:      "",
+			BarEnd:        "",
+		}),
+	)
+	if _, err = io.Copy(io.MultiWriter(&encBuf, bar), do.Body); err != nil {
+		return nil, err
+	}
+	fmt.Print("Downloaded\n")
+
+	// Phase 2: decrypt every fragment into an output buffer in RAM
+	conn, err := net.Dial("tcp", Config.DecryptM3u8Port)
+	if err != nil {
+		return nil, err
+	}
+	defer Close(conn)
+
+	inBuf := bufio.NewReader(&encBuf)
+	init, offset, err := ReadInitSegment(inBuf)
+	if err != nil {
+		return nil, err
+	}
+	if init == nil {
+		return nil, errors.New("no init segment found")
+	}
+	tracks, err := TransformInit(init)
+	if err != nil {
+		return nil, err
+	}
+	if err = sanitizeInit(init); err != nil {
+		fmt.Printf("Warning: unable to sanitize init completely: %s\n", err)
+	}
+
+	var outBuf bytes.Buffer
+	w := bufio.NewWriter(&outBuf)
+	if err = init.Encode(w); err != nil {
+		return nil, err
+	}
+
+	totalLen := int64(encBuf.Len()) + int64(offset)
+	decBar := progressbar.NewOptions64(totalLen,
+		progressbar.OptionClearOnFinish(),
+		progressbar.OptionSetElapsedTime(false),
+		progressbar.OptionSetPredictTime(false),
+		progressbar.OptionShowElapsedTimeOnFinish(),
+		progressbar.OptionShowCount(),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetDescription("Decrypting..."),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "",
+			SaucerHead:    "",
+			SaucerPadding: "",
+			BarStart:      "",
+			BarEnd:        "",
+		}),
+	)
+	decBar.Add64(int64(offset))
+
+	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+	for i := 0; ; i++ {
+		rawOffset := offset
+		frag, newOffset, err := ReadNextFragment(inBuf, offset)
+		rawOffset = newOffset - rawOffset
+		offset = newOffset
+		if err != nil {
+			return nil, err
+		}
+		if frag == nil {
+			break
+		}
+		seg := segments[i]
+		if seg == nil {
+			return nil, errors.New("segment number out of sync")
+		}
+		if key := seg.Key; key != nil {
+			if i != 0 {
+				SwitchKeys(rw)
+			}
+			if key.URI == prefetchKey {
+				SendString(rw, "0")
+			} else {
+				SendString(rw, adamId)
+			}
+			SendString(rw, key.URI)
+		}
+		if err = DecryptFragment(frag, tracks, rw); err != nil {
+			return nil, fmt.Errorf("decryptFragment: %w", err)
+		}
+		if err = frag.Encode(w); err != nil {
+			return nil, err
+		}
+		decBar.Add64(int64(rawOffset))
+	}
+	if err = w.Flush(); err != nil {
+		return nil, err
+	}
+	fmt.Print("Decrypted\n")
+	return &outBuf, nil
+}
+
 func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
-	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet) error {
+	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, durationInMillis int, Config structs.ConfigSet) error {
 	var buffer bytes.Buffer
 	var outBuf *bufio.Writer
 	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
@@ -189,6 +444,34 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 	if init == nil {
 		return errors.New("no init segment found")
 	}
+
+	// Capture original init size (bytes read from the stream) before any modifications.
+	originalInitSize := offset
+
+	// Inject mehd (Movie Extends Header) box so libavformat knows the full duration.
+	// Without it, ffplay derives duration from only the first moof fragment (~14.95s).
+	if len(init.Moov.Traks) > 0 && durationInMillis > 0 {
+		timescale := init.Moov.Traks[0].Mdia.Mdhd.Timescale
+		fragmentDuration := int64(uint64(durationInMillis) * uint64(timescale) / 1000)
+		if init.Moov.Mvex == nil {
+			mvex := &mp4.MvexBox{}
+			init.Moov.AddChild(mvex)
+		}
+		if init.Moov.Mvex.Mehd == nil {
+			mehd := &mp4.MehdBox{
+				Version:          1,
+				FragmentDuration: fragmentDuration,
+			}
+			init.Moov.Mvex.AddChild(mehd)
+		} else {
+			init.Moov.Mvex.Mehd.FragmentDuration = fragmentDuration
+		}
+	}
+
+	// Calculate how many bytes the mehd injection added to the init segment.
+	// Fragments that use an absolute BaseDataOffset must be shifted by this amount.
+	newInitSize := init.Size()
+	sizeDiff := int64(newInitSize) - int64(originalInitSize)
 
 	tracks, err := TransformInit(init)
 	if err != nil {
@@ -237,11 +520,16 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 			// check offset against Content-Length?
 			break
 		}
-		// print progress
 
-		// if totalLen > 0 {
-		// 	fmt.Printf("%.2f%% of %d bytes\n", 100*float32(offset)/float32(totalLen), totalLen)
-		// }
+		// If the init segment grew (e.g. mehd injection), shift any absolute
+		// BaseDataOffset pointers so the player can locate the audio payload.
+		if sizeDiff > 0 && frag.Moof != nil {
+			for _, traf := range frag.Moof.Trafs {
+				if traf.Tfhd != nil && traf.Tfhd.HasBaseDataOffset() {
+					traf.Tfhd.BaseDataOffset += uint64(sizeDiff)
+				}
+			}
+		}
 		segment := playlistSegments[i]
 		if segment == nil {
 			return errors.New("segment number out of sync")
@@ -265,6 +553,11 @@ func downloadAndDecryptFile(conn io.ReadWriter, in io.Reader, outfile string,
 		}
 		err = frag.Encode(outBuf)
 		if err != nil {
+			return err
+		}
+		// Flush each fragment to disk immediately so readers of the growing file
+		// (e.g. the HTTP streaming server) can see it without waiting for the next fragment.
+		if err = outBuf.Flush(); err != nil {
 			return err
 		}
 		bar.Add64(int64(rawoffset))
@@ -295,6 +588,38 @@ func sanitizeInit(init *mp4.InitSegment) error {
 	if len(traks) > 1 {
 		return errors.New("more than 1 track found")
 	}
+
+	// Zero out the duration fields in moov/tkhd/mdhd.
+	// Apple's encoder writes the first HLS segment's duration here (~15s), which is
+	// non-standard for fragmented MP4: per ISO 14496-12 these MUST be 0 in fMP4 files.
+	// Players like ffplay stop exactly at this declared duration, cutting off the rest
+	// of the track. Zeroing them forces players to derive duration from the fragments.
+	init.Moov.Mvhd.Duration = 0
+	trak := traks[0]
+	trak.Tkhd.Duration = 0
+	trak.Mdia.Mdhd.Duration = 0
+
+	// Zero the sample tables in stbl. In a valid fMP4 these MUST be empty — all sample
+	// timing and offsets live inside the moof fragments. Apple's encoder populates stts
+	// with one HLS segment's worth of entries (~15s), causing players to stop after that
+	// segment even though more moof data follows in the stream.
+	stbl := trak.Mdia.Minf.Stbl
+	if stbl.Stts != nil {
+		stbl.Stts.SampleCount = []uint32{}
+		stbl.Stts.SampleTimeDelta = []uint32{}
+	}
+	if stbl.Stco != nil {
+		stbl.Stco.ChunkOffset = []uint32{}
+	}
+	if stbl.Stsc != nil {
+		stbl.Stsc.Entries = nil
+	}
+	if stbl.Stsz != nil {
+		stbl.Stsz.SampleSize = nil
+		stbl.Stsz.SampleNumber = 0
+		stbl.Stsz.SampleUniformSize = 0
+	}
+
 	// Remove duplicate ec-3 or alac boxes in stsd since some programs (e.g. cuetools) don't
 	// like it when there's more than 1 entry in stsd.
 	// Every audio track contains two of these boxes because two IVs are needed to decrypt the

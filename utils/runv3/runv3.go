@@ -1,6 +1,7 @@
 package runv3
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -336,6 +337,173 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 		return "", err
 	}
 	return "", nil
+}
+
+// RunStream downloads the AAC track as a streaming HTTP GET and decrypts it
+// fragment-by-fragment, writing each decrypted moof+mdat to w immediately.
+// This allows ffplay to start playing within ~200ms of the first fragment arriving.
+func RunStream(adamId string, authtoken string, mutoken string, w io.Writer) error {
+	fileurl, kidBase64, uriPrefix, err := GetWebplayback(adamId, authtoken, mutoken, false)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, "pssh", kidBase64)
+	ctx = context.WithValue(ctx, "adamId", adamId)
+	ctx = context.WithValue(ctx, "uriPrefix", uriPrefix)
+	pssh, err := getPSSH("", kidBase64)
+	if err != nil {
+		return err
+	}
+	headers := map[string]string{
+		"authorization":            "Bearer " + authtoken,
+		"x-apple-music-user-token": mutoken,
+	}
+	cl := resty.New()
+	cl.SetHeaders(headers)
+	k := key.Key{
+		ReqCli:        cl,
+		BeforeRequest: BeforeRequest,
+		AfterRequest:  AfterRequest,
+	}
+	k.CdmInit()
+	_, keybt, err := k.GetKey(ctx, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense", pssh, nil)
+	if err != nil {
+		return err
+	}
+
+	// Streaming HTTP GET — no full-file buffering.
+	resp, err := http.Get(fileurl)
+	if err != nil {
+		return fmt.Errorf("stream GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	r := bufio.NewReaderSize(resp.Body, 256*1024) // 256 KB read-ahead
+	var offset uint64
+
+	// Read init segment (ftyp + moov) box by box.
+	init := mp4.NewMP4Init()
+	for {
+		box, err := mp4.DecodeBox(offset, r)
+		if err != nil {
+			return fmt.Errorf("reading init box: %w", err)
+		}
+		offset += box.Size()
+		init.AddChild(box)
+		if box.Type() == "moov" {
+			break
+		}
+	}
+	di, err := mp4.DecryptInit(init)
+	if err != nil {
+		return fmt.Errorf("DecryptInit: %w", err)
+	}
+	if err = init.Encode(w); err != nil {
+		return fmt.Errorf("writing init: %w", err)
+	}
+	// Flush init segment immediately so the player can start parsing codec info.
+	if fw, ok := w.(interface{ Flush() error }); ok {
+		_ = fw.Flush()
+	}
+
+	// Stream fragments: read moof+mdat, decrypt, write, flush — one at a time.
+	fragN := 0
+	for {
+		box, err := mp4.DecodeBox(offset, r)
+		if err == io.EOF {
+			fmt.Printf("\r🎵 Stream complete (%d fragments)\n", fragN)
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("reading fragment box: %w", err)
+		}
+		offset += box.Size()
+
+		switch box.Type() {
+		case "styp", "sidx", "prft", "emsg":
+			// Pass through non-media boxes without decryption.
+			if err = box.Encode(w); err != nil {
+				return err
+			}
+		case "moof":
+			moof, ok := box.(*mp4.MoofBox)
+			if !ok {
+				continue
+			}
+			// The mdat immediately follows moof in Apple's fMP4 layout.
+			mdatBox, err := mp4.DecodeBox(offset, r)
+			if err != nil {
+				return fmt.Errorf("reading mdat: %w", err)
+			}
+			offset += mdatBox.Size()
+
+			frag := mp4.NewFragment()
+			frag.AddChild(moof)
+			frag.AddChild(mdatBox)
+
+			seg := mp4.NewMediaSegmentWithoutStyp()
+			seg.AddFragment(frag)
+
+			if err = mp4.DecryptSegment(seg, di, keybt); err != nil {
+				if err.Error() == "no senc box in traf" {
+					err = nil
+				} else {
+					return fmt.Errorf("DecryptSegment: %w", err)
+				}
+			}
+			if err = seg.Encode(w); err != nil {
+				return fmt.Errorf("writing segment: %w", err)
+			}
+			fragN++
+			fmt.Printf("\r⚡ Fragment %d piped to player", fragN)
+			// Flush after every fragment so the player receives data immediately.
+			if fw, ok := w.(interface{ Flush() error }); ok {
+				_ = fw.Flush()
+			}
+		}
+	}
+}
+// No disk I/O is performed — the caller can pipe the buffer directly to a media player.
+func RunToBuffer(adamId string, authtoken string, mutoken string) (*bytes.Buffer, error) {
+	fileurl, kidBase64, uriPrefix, err := GetWebplayback(adamId, authtoken, mutoken, false)
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, "pssh", kidBase64)
+	ctx = context.WithValue(ctx, "adamId", adamId)
+	ctx = context.WithValue(ctx, "uriPrefix", uriPrefix)
+	pssh, err := getPSSH("", kidBase64)
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
+	headers := map[string]string{
+		"authorization":            "Bearer " + authtoken,
+		"x-apple-music-user-token": mutoken,
+	}
+	cl := resty.New()
+	cl.SetHeaders(headers)
+	k := key.Key{
+		ReqCli:        cl,
+		BeforeRequest: BeforeRequest,
+		AfterRequest:  AfterRequest,
+	}
+	k.CdmInit()
+	_, keybt, err := k.GetKey(ctx, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense", pssh, nil)
+	if err != nil {
+		fmt.Println(err)
+		return nil, err
+	}
+	body := extsong(fileurl)
+	var buffer bytes.Buffer
+	if err = DecryptMP4(&body, keybt, &buffer); err != nil {
+		fmt.Print("Decryption failed\n")
+		return nil, err
+	}
+	fmt.Print("Decrypted\n")
+	return &buffer, nil
 }
 
 // Segment 结构体用于在 Channel 中传递分段数据
