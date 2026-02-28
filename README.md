@@ -27,8 +27,46 @@ For acquisition`aac-lc` `MV` `lyrics` You must fill in the information with a su
 
 Original script by Sorrow. Modified by me to include some fixes and improvements.
 
+## Running with Docker
+
+1. Make sure the decryption program [wrapper](https://github.com/WorldObservationLog/wrapper) is running
+
+2. Start the downloader with Docker:
+   ```bash
+   # show help
+   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --help
+
+   # start downloading some albums
+   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader https://music.apple.com/ru/album/children-of-forever/1443732441 
+
+   # start downloading single song
+   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --song https://music.apple.com/ru/album/bass-folk-song/1443732441?i=1443732453
+
+   # start downloading select
+   docker run -it --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --select https://music.apple.com/ru/album/children-of-forever/1443732441
+
+   # start downloading some playlists
+   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader https://music.apple.com/us/playlist/taylor-swift-essentials/pl.3950454ced8c45a3b0cc693c2a7db97b
+
+   # for dolby atmos
+   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --atmos https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
+   
+   # for aac
+   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --aac https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
+
+   # for see quality
+   docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --debug https://music.apple.com/ru/album/miles-smiles/209407331
+   ```
+
+You can change `config.yaml` by mounting a volume:
+
+> **Note:** Before running the following command, make sure that a `config.yaml` file exists in your current directory. You can create your own, or copy the default one from the repository (if available). If `./config.yaml` does not exist, Docker will create an empty directory instead of a file, which will cause the container to fail.
+```bash
+docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config.yaml ghcr.io/zhaarey/apple-music-downloader [args]
+```
+
 ## How to use
-1. Make sure the decryption program [wrapper](https://github.com/zhaarey/wrapper) is running
+1. Make sure the decryption program [wrapper](https://github.com/WorldObservationLog/wrapper) is running
 2. Start downloading some albums: `go run main.go https://music.apple.com/us/album/whenever-you-need-somebody-2022-remaster/1624945511`.
 3. Start downloading single song: `go run main.go --song https://music.apple.com/us/album/never-gonna-give-you-up-2022-remaster/1624945511?i=1624945512` or `go run main.go https://music.apple.com/us/song/you-move-me-2022-remaster/1624945520`.
 4. Start downloading select: `go run main.go --select https://music.apple.com/us/album/whenever-you-need-somebody-2022-remaster/1624945511` input numbers separated by spaces.
