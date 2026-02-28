@@ -8,38 +8,6 @@ Original script by Sorrow. Modified with additional fixes, improvements, and str
 
 ---
 
-## Running with Docker
-
-```bash
-# Show help
-docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --help
-
-# Download an album
-docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader https://music.apple.com/us/album/children-of-forever/1443732441
-
-# Download a single song
-docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --song "https://music.apple.com/us/album/bass-folk-song/1443732441?i=1443732453"
-
-# Interactive select
-docker run -it --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --select https://music.apple.com/us/album/children-of-forever/1443732441
-
-# Download a playlist
-docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader https://music.apple.com/us/playlist/taylor-swift-essentials/pl.3950454ced8c45a3b0cc693c2a7db97b
-
-# Dolby Atmos
-docker run --network host -v ./downloads:/downloads ghcr.io/zhaarey/apple-music-downloader --atmos https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538
-```
-
-Mount a custom `config.yaml`:
-
-> **Note:** Make sure `config.yaml` exists in your current directory before running. If it does not exist, Docker will create an empty directory instead of a file.
-
-```bash
-docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config.yaml ghcr.io/zhaarey/apple-music-downloader [args]
-```
-
----
-
 ## Requirements
 
 - [MP4Box](https://gpac.io/downloads/gpac-nightly-builds/) — must be installed and on your `PATH`
