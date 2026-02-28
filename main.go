@@ -45,6 +45,7 @@ var (
 	artist_select  bool
 	debug_mode     bool
 	play_stream    bool
+	print_json     bool
 	alac_max       *int
 	atmos_max      *int
 	mv_max         *int
@@ -53,7 +54,16 @@ var (
 	Config         structs.ConfigSet
 	counter        structs.Counter
 	okDict         = make(map[string][]int)
+	AddedTracks    []AddedTrack
 )
+
+type AddedTrack struct {
+	Path     string `json:"path"`
+	Artist   string `json:"artist"`
+	ArtistID string `json:"artist_id"`
+	Album    string `json:"album"`
+	Song     string `json:"song"`
+}
 
 func loadConfig() error {
 	data, err := os.ReadFile("config.yaml")
@@ -1050,6 +1060,18 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		fmt.Println("Track already exists locally.")
 		counter.Success++
 		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+
+		tArtistId := ""
+		if len(track.Resp.Relationships.Artists.Data) > 0 {
+			tArtistId = track.Resp.Relationships.Artists.Data[0].ID
+		}
+		AddedTracks = append(AddedTracks, AddedTrack{
+			Path:     trackPath,
+			Artist:   track.Resp.Attributes.ArtistName,
+			ArtistID: tArtistId,
+			Album:    track.Resp.Attributes.AlbumName,
+			Song:     track.Resp.Attributes.Name,
+		})
 		return
 	}
 	if considerConverted {
@@ -1058,6 +1080,18 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			fmt.Println("Converted track already exists locally.")
 			counter.Success++
 			okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+
+			tArtistId := ""
+			if len(track.Resp.Relationships.Artists.Data) > 0 {
+				tArtistId = track.Resp.Relationships.Artists.Data[0].ID
+			}
+			AddedTracks = append(AddedTracks, AddedTrack{
+				Path:     convertedPath,
+				Artist:   track.Resp.Attributes.ArtistName,
+				ArtistID: tArtistId,
+				Album:    track.Resp.Attributes.AlbumName,
+				Song:     track.Resp.Attributes.Name,
+			})
 			return
 		}
 	}
@@ -1131,6 +1165,18 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 
 	// CONVERSION FEATURE hook
 	convertIfNeeded(track)
+
+	tArtistId := ""
+	if len(track.Resp.Relationships.Artists.Data) > 0 {
+		tArtistId = track.Resp.Relationships.Artists.Data[0].ID
+	}
+	AddedTracks = append(AddedTracks, AddedTrack{
+		Path:     track.SavePath,
+		Artist:   track.Resp.Attributes.ArtistName,
+		ArtistID: tArtistId,
+		Album:    track.Resp.Attributes.AlbumName,
+		Song:     track.Resp.Attributes.Name,
+	})
 
 	counter.Success++
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
@@ -1255,6 +1301,13 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			okDict[station.ID] = append(okDict[station.ID], 1)
 
 			fmt.Println("Radio already exists locally.")
+			AddedTracks = append(AddedTracks, AddedTrack{
+				Path:     trackPath,
+				Artist:   "Apple Music Station",
+				ArtistID: "",
+				Album:    station.Name,
+				Song:     station.Name,
+			})
 			return nil
 		}
 		assetsUrl, serverUrl, err := ampapi.GetStationAssetsUrlAndServerUrl(station.ID, mediaUserToken, token)
@@ -1292,6 +1345,13 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 		}
 		counter.Success++
 		okDict[station.ID] = append(okDict[station.ID], 1)
+		AddedTracks = append(AddedTracks, AddedTrack{
+			Path:     trackPath,
+			Artist:   "Apple Music Station",
+			ArtistID: "",
+			Album:    station.Name,
+			Song:     station.Name,
+		})
 		return nil
 	}
 
@@ -2062,6 +2122,7 @@ func main() {
 	mv_audio_type = pflag.String("mv-audio-type", Config.MVAudioType, "Select MV audio type, atmos ac3 aac")
 	mv_max = pflag.Int("mv-max", Config.MVMax, "Specify the max quality for download MV")
 	pflag.BoolVar(&play_stream, "stream", false, "Enable stream mode to play music directly without saving")
+	pflag.BoolVar(&print_json, "json", false, "Output JSON summary at the end")
 
 	pflag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] [url1 url2 ...]\n", "[main | main.exe | go run main.go]")
@@ -2241,6 +2302,16 @@ func main() {
 		fmt.Println("Start trying again...")
 		counter = structs.Counter{}
 	}
+
+	// Print JSON output
+	if print_json {
+		jsonOutput, err := json.Marshal(AddedTracks)
+		if err != nil {
+			fmt.Println("Error generating JSON output:", err)
+		} else {
+			fmt.Println(string(jsonOutput))
+		}
+	}
 }
 
 func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track) error {
@@ -2269,6 +2340,22 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 	exists, _ := fileExists(mvOutPath)
 	if exists {
 		fmt.Println("MV already exists locally.")
+
+		mvArtistName := MVInfo.Data[0].Attributes.ArtistName
+		mvAlbumName := MVInfo.Data[0].Attributes.AlbumName
+		mvName := MVInfo.Data[0].Attributes.Name
+		mvArtistId := ""
+		if len(MVInfo.Data[0].Relationships.Artists.Data) > 0 {
+			mvArtistId = MVInfo.Data[0].Relationships.Artists.Data[0].ID
+		}
+
+		AddedTracks = append(AddedTracks, AddedTrack{
+			Path:     mvOutPath,
+			Artist:   mvArtistName,
+			ArtistID: mvArtistId,
+			Album:    mvAlbumName,
+			Song:     mvName,
+		})
 		return nil
 	}
 
@@ -2360,6 +2447,24 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 		return err
 	}
 	fmt.Printf("\rMV Remuxed.   \n")
+
+	// Append to AddedTracks
+	mvArtistName := MVInfo.Data[0].Attributes.ArtistName
+	mvAlbumName := MVInfo.Data[0].Attributes.AlbumName
+	mvName := MVInfo.Data[0].Attributes.Name
+	mvArtistId := ""
+	if len(MVInfo.Data[0].Relationships.Artists.Data) > 0 {
+		mvArtistId = MVInfo.Data[0].Relationships.Artists.Data[0].ID
+	}
+
+	AddedTracks = append(AddedTracks, AddedTrack{
+		Path:     mvOutPath,
+		Artist:   mvArtistName,
+		ArtistID: mvArtistId,
+		Album:    mvAlbumName,
+		Song:     mvName,
+	})
+
 	return nil
 }
 
