@@ -14,9 +14,27 @@ type SearchResp struct {
 
 // SearchResults contains the different types of search results.
 type SearchResults struct {
-	Songs   *SongResults   `json:"songs,omitempty"`
-	Albums  *AlbumResults  `json:"albums,omitempty"`
-	Artists *ArtistResults `json:"artists,omitempty"`
+	Songs     *SongResults     `json:"songs,omitempty"`
+	Albums    *AlbumResults    `json:"albums,omitempty"`
+	Artists   *ArtistResults   `json:"artists,omitempty"`
+	Playlists *PlaylistResults `json:"playlists,omitempty"`
+}
+
+// PlaylistResults contains a list of playlist search results.
+type PlaylistResults struct {
+	Href string `json:"href"`
+	Next string `json:"next"`
+	Data []struct {
+		ID         string `json:"id"`
+		Type       string `json:"type"`
+		Href       string `json:"href"`
+		Attributes struct {
+			Name          string `json:"name"`
+			CuratorName   string `json:"curatorName"`
+			TrackTypes    []string `json:"trackTypes"`
+			URL           string `json:"url"`
+		} `json:"attributes"`
+	} `json:"data"`
 }
 
 // SongResults contains a list of song search results.

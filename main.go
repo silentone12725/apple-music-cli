@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"main/utils/ampapi"
@@ -54,6 +55,74 @@ var (
 	counter        structs.Counter
 	okDict         = make(map[string][]int)
 )
+
+// streamCacheResult holds the result of a background track preparation.
+type streamCacheResult struct {
+	path string
+	err  error
+}
+
+// streamCache maps track.ID → buffered channel (cap 1) with the prepared temp file path.
+var streamCache sync.Map
+
+// startPrefetchTrack kicks off background download+decrypt+MP4Box for a track.
+// Idempotent: a second call for the same track.ID is a no-op.
+func startPrefetchTrack(track *task.Track, token, mediaUserToken string) {
+	ch := make(chan streamCacheResult, 1)
+	if _, loaded := streamCache.LoadOrStore(track.ID, ch); loaded {
+		return
+	}
+	go func() {
+		path, err := prepareAlacStreamFile(track)
+		ch <- streamCacheResult{path, err}
+	}()
+}
+
+// takePrefetchResult retrieves and removes a prefetched result. Returns ok=false if
+// no prefetch was started. The caller owns the file at result.path and must os.Remove it.
+func takePrefetchResult(trackID string) (streamCacheResult, bool) {
+	v, ok := streamCache.LoadAndDelete(trackID)
+	if !ok {
+		return streamCacheResult{}, false
+	}
+	return <-v.(chan streamCacheResult), true
+}
+
+// prepareAlacStreamFile downloads, decrypts, and MP4Box-converts a track to a /dev/shm
+// temp file. Returns the playable path. Empty path means AAC (handled inline by ripTrack).
+func prepareAlacStreamFile(track *task.Track) (string, error) {
+	needDlAacLc := dl_aac && Config.AacType == "aac-lc"
+	if track.WebM3u8 == "" && !needDlAacLc {
+		needDlAacLc = true
+	}
+	if needDlAacLc {
+		return "", nil // AAC tracks are piped inline; nothing to prefetch
+	}
+	trackM3u8Url, _, err := extractMedia(track.M3u8, false)
+	if err != nil {
+		return "", fmt.Errorf("extractMedia: %w", err)
+	}
+	tmpDir := "/dev/shm"
+	if _, serr := os.Stat(tmpDir); serr != nil {
+		tmpDir = os.TempDir()
+	}
+	tf, err := os.CreateTemp(tmpDir, "am-stream-*.m4a")
+	if err != nil {
+		return "", err
+	}
+	tempPath := tf.Name()
+	tf.Close()
+	os.Remove(tempPath)
+	if err := runv2.Run(track.ID, trackM3u8Url, tempPath, track.Resp.Attributes.DurationInMillis, Config); err != nil {
+		os.Remove(tempPath)
+		return "", fmt.Errorf("runv2.Run: %w", err)
+	}
+	mp4boxCmd := exec.Command("MP4Box", "-noprog", "-itags", "tool=", tempPath)
+	mp4boxCmd.Stderr = io.Discard
+	mp4boxCmd.Stdout = io.Discard
+	mp4boxCmd.Run()
+	return tempPath, nil
+}
 
 func loadConfig() error {
 	data, err := os.ReadFile("config.yaml")
@@ -531,9 +600,9 @@ func promptForAction() error {
 // handleSearch manages the entire interactive search process.
 func handleSearch(searchType string, queryParts []string, token string) (string, error) {
 	query := strings.Join(queryParts, " ")
-	validTypes := map[string]bool{"album": true, "song": true, "artist": true}
+	validTypes := map[string]bool{"album": true, "song": true, "artist": true, "playlist": true}
 	if !validTypes[searchType] {
-		return "", fmt.Errorf("invalid search type: %s. Use 'album', 'song', or 'artist'", searchType)
+		return "", fmt.Errorf("invalid search type: %s. Use 'album', 'song', 'artist', or 'playlist'", searchType)
 	}
 
 	fmt.Printf("Searching for %ss: \"%s\" in storefront \"%s\"\n", searchType, query, Config.Storefront)
@@ -598,6 +667,15 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 				}
 				hasNext = searchResp.Results.Artists.Next != ""
 			}
+		case "playlist":
+			if searchResp.Results.Playlists != nil {
+				for _, item := range searchResp.Results.Playlists.Data {
+					detail := item.Attributes.CuratorName
+					displayOptions = append(displayOptions, fmt.Sprintf("%s - %s", item.Attributes.Name, detail))
+					items = append(items, SearchResultItem{Type: "Playlist", Name: item.Attributes.Name, URL: item.Attributes.URL, ID: item.ID, Traits: []string{}})
+				}
+				hasNext = searchResp.Results.Playlists.Next != ""
+			}
 		}
 
 		if len(items) == 0 && offset == 0 {
@@ -646,6 +724,11 @@ func handleSearch(searchType string, queryParts []string, token string) (string,
 		// Automatically set single song download flag
 		if selectedItem.Type == "Song" {
 			dl_song = true
+		}
+
+		// Playlists don't have a single audio trait — skip quality prompt and use defaults.
+		if selectedItem.Type == "Playlist" {
+			return selectedItem.URL, nil
 		}
 
 		quality, err := promptForQuality(selectedItem, token)
@@ -962,6 +1045,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			}
 		}
 		if playPath != "" {
+			// Discard any prefetched temp file — we have a local copy already.
+			if res, ok := takePrefetchResult(track.ID); ok && res.path != "" {
+				os.Remove(res.path)
+			}
 			fmt.Println("\n▶️ Playing local file from disk...")
 			if err := PlayMedia(playPath); err != nil {
 				fmt.Println("Playback error:", err)
@@ -1001,44 +1088,57 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 
 		// ── ALAC / ATMOS STREAM PIPELINE ─────────────────────────────────────────
 		// Decrypt via the proven Run() path into a /dev/shm RAM-backed temp file.
-		// RunStreamWriter produces an fMP4 that ffplay can only parse one fragment
-		// from (~15s); Run() produces the same format as a regular download, which
-		// ffplay reads correctly.  /dev/shm means no disk I/O — effectively RAM speed.
-		trackM3u8Url, _, err := extractMedia(track.M3u8, false)
-		if err != nil {
-			fmt.Println("Failed to extract info from manifest:", err)
-			return
+		// If a background prefetch already completed for this track, reuse that file
+		// directly (skipping download + MP4Box — they already happened).
+		var tempPath string
+		var usedCache bool
+		if res, ok := takePrefetchResult(track.ID); ok {
+			if res.err != nil {
+				fmt.Println("Prefetch error (falling back to direct download):", res.err)
+			} else {
+				tempPath = res.path
+				usedCache = true
+				fmt.Println("▶️  (prefetched — ready instantly)")
+			}
 		}
-		tmpDir := "/dev/shm"
-		if _, serr := os.Stat(tmpDir); serr != nil {
-			tmpDir = os.TempDir()
-		}
-		// CreateTemp just to get a unique path; close immediately so Run() can create it.
-		tf, err := os.CreateTemp(tmpDir, "am-stream-*.m4a")
-		if err != nil {
-			fmt.Println("Temp file error:", err)
-			return
-		}
-		tempPath := tf.Name()
-		tf.Close()
-		os.Remove(tempPath) // Run() will recreate it via os.Create
 
-		if decErr := runv2.Run(track.ID, trackM3u8Url, tempPath, track.Resp.Attributes.DurationInMillis, Config); decErr != nil {
-			fmt.Println("Decrypt error:", decErr)
-			os.Remove(tempPath)
-			return
+		if !usedCache {
+			trackM3u8Url, _, err := extractMedia(track.M3u8, false)
+			if err != nil {
+				fmt.Println("Failed to extract info from manifest:", err)
+				return
+			}
+			tmpDir := "/dev/shm"
+			if _, serr := os.Stat(tmpDir); serr != nil {
+				tmpDir = os.TempDir()
+			}
+			// CreateTemp just to get a unique path; close immediately so Run() can create it.
+			tf, err := os.CreateTemp(tmpDir, "am-stream-*.m4a")
+			if err != nil {
+				fmt.Println("Temp file error:", err)
+				return
+			}
+			tempPath = tf.Name()
+			tf.Close()
+			os.Remove(tempPath) // Run() will recreate it via os.Create
+
+			if decErr := runv2.Run(track.ID, trackM3u8Url, tempPath, track.Resp.Attributes.DurationInMillis, Config); decErr != nil {
+				fmt.Println("Decrypt error:", decErr)
+				os.Remove(tempPath)
+				return
+			}
+
+			// Convert fMP4 → flat MP4 exactly like the regular download path does.
+			// Without this, ffplay/ffprobe can only read the first fragment (~15s).
+			mp4boxCmd := exec.Command("MP4Box", "-noprog", "-itags", "tool=", tempPath)
+			mp4boxCmd.Stderr = io.Discard
+			mp4boxCmd.Stdout = io.Discard
+			if err := mp4boxCmd.Run(); err != nil {
+				fmt.Println("Warning: MP4Box conversion failed, playback may be truncated:", err)
+			}
 		}
 
 		playPath = tempPath
-
-		// Convert fMP4 → flat MP4 exactly like the regular download path does.
-		// Without this, ffplay/ffprobe can only read the first fragment (~15s).
-		mp4boxCmd := exec.Command("MP4Box", "-noprog", "-itags", "tool=", tempPath)
-		mp4boxCmd.Stderr = io.Discard
-		mp4boxCmd.Stdout = io.Discard
-		if err := mp4boxCmd.Run(); err != nil {
-			fmt.Println("Warning: MP4Box conversion failed, playback may be truncated:", err)
-		}
 
 		fmt.Println("▶️  Playback started! (Press 'q' to stop)")
 		var alacCmd *exec.Cmd
@@ -1616,47 +1716,30 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		selected = album.ShowSelect()
 	}
 	if play_stream {
-		i := 0
-		for i < len(selected) {
-			trackIndex := selected[i] - 1
-			track := &album.Tracks[trackIndex]
-
-			fmt.Printf("\n▶️ Now Playing: %s - %s\n", track.Resp.Attributes.ArtistName, track.Resp.Attributes.Name)
-
-			// Play the track (blocks until finished or skipped via 'q' in mpv)
-			ripTrack(track, token, mediaUserToken)
-
-			if i == len(selected)-1 {
-				fmt.Println("End of queue.")
-				break
+		prefetchStarted := make([]bool, len(selected))
+		maybeStartPrefetch := func(idx int) {
+			if idx < 0 || idx >= len(selected) || prefetchStarted[idx] {
+				return
 			}
-
-			navPrompt := &survey.Select{
-				Message: "Playback stopped. Choose next action:",
-				Options: []string{"⏭️ Next Track", "⏮️ Previous Track", "🔁 Replay", "⏹️ Stop"},
-				PageSize: 4,
-			}
-
-			var choice string
-			err := survey.AskOne(navPrompt, &choice)
-			if err != nil {
-				break
-			}
-
-			switch choice {
-			case "⏭️ Next Track":
-				i++
-			case "⏮️ Previous Track":
-				if i > 0 {
-					i--
-				} else {
-					fmt.Println("Already at the first track.")
-				}
-			case "🔁 Replay": // Do nothing, index stays the same
-			case "⏹️ Stop":
-				return nil
-			}
+			prefetchStarted[idx] = true
+			startPrefetchTrack(&album.Tracks[selected[idx]-1], token, mediaUserToken)
 		}
+		maybeStartPrefetch(0)
+		maybeStartPrefetch(1)
+		maybeStartPrefetch(2)
+
+		for i := 0; i < len(selected); i++ {
+			maybeStartPrefetch(i + 1)
+			maybeStartPrefetch(i + 2)
+
+			track := &album.Tracks[selected[i]-1]
+			fmt.Printf("\n▶️ Now Playing (%d/%d): %s - %s\n",
+				i+1, len(selected),
+				track.Resp.Attributes.ArtistName, track.Resp.Attributes.Name)
+
+			ripTrack(track, token, mediaUserToken)
+		}
+		fmt.Println("🎵 End of album.")
 	} else {
 		// --- ORIGINAL DOWNLOAD LOOP ---
 		for i := range album.Tracks {
@@ -1902,47 +1985,33 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		selected = playlist.ShowSelect()
 	}
 	if play_stream {
-		i := 0
-		for i < len(selected) {
-			trackIndex := selected[i] - 1
-			track := &playlist.Tracks[trackIndex]
-
-			fmt.Printf("\n▶️ Now Playing: %s - %s\n", track.Resp.Attributes.ArtistName, track.Resp.Attributes.Name)
-
-			// Play the track (blocks until finished or skipped via 'q' in mpv)
-			ripTrack(track, token, mediaUserToken)
-
-			if i == len(selected)-1 {
-				fmt.Println("End of queue.")
-				break
+		prefetchStarted := make([]bool, len(selected))
+		maybeStartPrefetch := func(idx int) {
+			if idx < 0 || idx >= len(selected) || prefetchStarted[idx] {
+				return
 			}
-
-			navPrompt := &survey.Select{
-				Message: "Playback stopped. Choose next action:",
-				Options: []string{"⏭️ Next Track", "⏮️ Previous Track", "🔁 Replay", "⏹️ Stop"},
-				PageSize: 4,
-			}
-
-			var choice string
-			err := survey.AskOne(navPrompt, &choice)
-			if err != nil {
-				break
-			}
-
-			switch choice {
-			case "⏭️ Next Track":
-				i++
-			case "⏮️ Previous Track":
-				if i > 0 {
-					i--
-				} else {
-					fmt.Println("Already at the first track.")
-				}
-			case "🔁 Replay": // Do nothing, index stays the same
-			case "⏹️ Stop":
-				return nil
-			}
+			prefetchStarted[idx] = true
+			startPrefetchTrack(&playlist.Tracks[selected[idx]-1], token, mediaUserToken)
 		}
+		// Kick off the first three tracks immediately so the second song is ready
+		// well before the first one finishes playing.
+		maybeStartPrefetch(0)
+		maybeStartPrefetch(1)
+		maybeStartPrefetch(2)
+
+		for i := 0; i < len(selected); i++ {
+			// Keep the prefetch window 2 tracks ahead.
+			maybeStartPrefetch(i + 1)
+			maybeStartPrefetch(i + 2)
+
+			track := &playlist.Tracks[selected[i]-1]
+			fmt.Printf("\n▶️ Now Playing (%d/%d): %s - %s\n",
+				i+1, len(selected),
+				track.Resp.Attributes.ArtistName, track.Resp.Attributes.Name)
+
+			ripTrack(track, token, mediaUserToken)
+		}
+		fmt.Println("🎵 End of playlist.")
 	} else {
 		// --- ORIGINAL DOWNLOAD LOOP ---
 		for i := range playlist.Tracks {
@@ -2097,11 +2166,18 @@ func main() {
 
 	// Allow `--stream song "query"` as shorthand for `--stream --search song "query"`.
 	// If --search wasn't given but the first positional arg is a valid search type, promote it.
+	// However, if the next arg looks like a direct URL, just strip the type keyword and let
+	// the normal URL processing loop handle it (e.g. `--stream playlist https://...`).
 	if search_type == "" && play_stream && len(args) >= 2 {
 		implicit := args[0]
-		if implicit == "song" || implicit == "album" || implicit == "artist" {
-			search_type = implicit
-			args = args[1:]
+		if implicit == "song" || implicit == "album" || implicit == "artist" || implicit == "playlist" {
+			if strings.HasPrefix(args[1], "http") {
+				// Direct URL — strip the keyword but don't trigger search.
+				args = args[1:]
+			} else {
+				search_type = implicit
+				args = args[1:]
+			}
 		}
 	}
 
