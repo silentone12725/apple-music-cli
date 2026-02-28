@@ -37,6 +37,10 @@ type PlaybackLicense struct {
 	Status     int    `json:"status"`
 }
 
+// kidKeyCache caches Widevine decryption keys by KID (base64).
+// Subsequent plays of the same track skip the CDM round-trip entirely.
+var kidKeyCache sync.Map
+
 func getPSSH(contentId string, kidBase64 string) (string, error) {
 	kidBytes, err := base64.StdEncoding.DecodeString(kidBase64)
 	if err != nil {
@@ -341,45 +345,84 @@ func Run(adamId string, trackpath string, authtoken string, mutoken string, mvmo
 
 // RunStream downloads the AAC track as a streaming HTTP GET and decrypts it
 // fragment-by-fragment, writing each decrypted moof+mdat to w immediately.
-// This allows ffplay to start playing within ~200ms of the first fragment arriving.
+// Optimisations:
+//  - Widevine key is cached by KID — CDM round-trip skipped on repeat plays.
+//  - HTTP GET and CDM handshake run in parallel; playback starts as soon as
+//    both are ready (whichever finishes last is the only gate).
+//  - 64 KB read-ahead so the first fragment is available to the pipe fast.
 func RunStream(adamId string, authtoken string, mutoken string, w io.Writer) error {
 	fileurl, kidBase64, uriPrefix, err := GetWebplayback(adamId, authtoken, mutoken, false)
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, "pssh", kidBase64)
-	ctx = context.WithValue(ctx, "adamId", adamId)
-	ctx = context.WithValue(ctx, "uriPrefix", uriPrefix)
-	pssh, err := getPSSH("", kidBase64)
-	if err != nil {
-		return err
-	}
-	headers := map[string]string{
-		"authorization":            "Bearer " + authtoken,
-		"x-apple-music-user-token": mutoken,
-	}
-	cl := resty.New()
-	cl.SetHeaders(headers)
-	k := key.Key{
-		ReqCli:        cl,
-		BeforeRequest: BeforeRequest,
-		AfterRequest:  AfterRequest,
-	}
-	k.CdmInit()
-	_, keybt, err := k.GetKey(ctx, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense", pssh, nil)
-	if err != nil {
-		return err
-	}
 
-	// Streaming HTTP GET — no full-file buffering.
-	resp, err := http.Get(fileurl)
-	if err != nil {
-		return fmt.Errorf("stream GET failed: %w", err)
+	// ── parallel: HTTP GET ────────────────────────────────────────────────────
+	type httpResult struct {
+		resp *http.Response
+		err  error
 	}
-	defer resp.Body.Close()
+	httpCh := make(chan httpResult, 1)
+	go func() {
+		resp, err := http.Get(fileurl)
+		httpCh <- httpResult{resp, err}
+	}()
 
-	r := bufio.NewReaderSize(resp.Body, 256*1024) // 256 KB read-ahead
+	// ── parallel: CDM key fetch (cache-first) ─────────────────────────────────
+	type keyResult struct {
+		keybt []byte
+		err   error
+	}
+	keyCh := make(chan keyResult, 1)
+	go func() {
+		if cached, ok := kidKeyCache.Load(kidBase64); ok {
+			fmt.Print("🔑 Key from cache\n")
+			keyCh <- keyResult{keybt: cached.([]byte)}
+			return
+		}
+		ctx := context.Background()
+		ctx = context.WithValue(ctx, "pssh", kidBase64)
+		ctx = context.WithValue(ctx, "adamId", adamId)
+		ctx = context.WithValue(ctx, "uriPrefix", uriPrefix)
+		pssh, err := getPSSH("", kidBase64)
+		if err != nil {
+			keyCh <- keyResult{err: err}
+			return
+		}
+		headers := map[string]string{
+			"authorization":            "Bearer " + authtoken,
+			"x-apple-music-user-token": mutoken,
+		}
+		cl := resty.New()
+		cl.SetHeaders(headers)
+		k := key.Key{
+			ReqCli:        cl,
+			BeforeRequest: BeforeRequest,
+			AfterRequest:  AfterRequest,
+		}
+		k.CdmInit()
+		_, kb, err := k.GetKey(ctx, "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/acquireWebPlaybackLicense", pssh, nil)
+		if err != nil {
+			keyCh <- keyResult{err: err}
+			return
+		}
+		kidKeyCache.Store(kidBase64, kb)
+		keyCh <- keyResult{keybt: kb}
+	}()
+
+	// ── wait for both ─────────────────────────────────────────────────────────
+	hr := <-httpCh
+	if hr.err != nil {
+		return fmt.Errorf("stream GET failed: %w", hr.err)
+	}
+	defer hr.resp.Body.Close()
+
+	kr := <-keyCh
+	if kr.err != nil {
+		return kr.err
+	}
+	keybt := kr.keybt
+
+	r := bufio.NewReaderSize(hr.resp.Body, 64*1024) // 64 KB — first fragment arrives faster
 	var offset uint64
 
 	// Read init segment (ftyp + moov) box by box.
